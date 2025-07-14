@@ -1,0 +1,1 @@
+MkulimaMkononi is a digital AgriTech solution designed to empower smallholder farmers in Africa. It leverages Africa's Talking USSD and SMS APIs to provide accessible, timely, and personalized agricultural advisory services directly to mobile phones. The project aims to bridge information gaps, helping farmers make informed decisions and improve productivity
