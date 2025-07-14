@@ -2,6 +2,8 @@ import os
 from flask import Flask, request
 from dotenv import load_dotenv
 import requests # Import the requests library for making HTTP calls
+import json
+import africastalking
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,6 +24,12 @@ AT_API_KEY = os.getenv("AT_API_KEY")
 # OPENWEATHER_API_KEY="YOUR_OPENWEATHERMAP_API_KEY"
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
+
+# --- Gemini API Key (for the AI chatbox) ---
+# IMPORTANT: As per instructions, leave this as an empty string.
+# The Canvas environment will automatically provide the API key at runtime.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 # Basic checks to ensure credentials are loaded
 if not AT_USERNAME or not AT_API_KEY:
     print("WARNING: Africa's Talking credentials (AT_USERNAME, AT_API_KEY) not found in environment or .env file.")
@@ -31,6 +39,17 @@ if not OPENWEATHER_API_KEY:
     print("WARNING: OpenWeatherMap API key (OPENWEATHER_API_KEY) not found in environment or .env file.")
     print("Weather forecast functionality may not work.")
 
+if not GEMINI_API_KEY:
+    print("WARNING: Gemini API key (GEMINI_API_KEY) not found in environment or .env file.")
+    print("AI chatbox functionality may not work locally. Ensure it's in your .env for local testing.")
+
+try:
+    africastalking.initialize(AT_USERNAME, AT_API_KEY)
+    sms = africastalking.SMS
+    print("Africa's Talking SDK initialized successfully.")
+except Exception as e:
+    print(f"ERROR: Failed to initialize Africa's Talking SDK: {e}")
+    sms = None 
 
 # --- Session State Storage ---
 # This dictionary will temporarily store the state of each USSD session.
@@ -86,13 +105,72 @@ def get_weather_forecast(city_name):
         print(f"An unexpected error occurred in get_weather_forecast: {e}")
         return "END An unknown error occurred. Please try again."
 
+# --- Helper Function to Ask AI Question (Gemini API) ---
+def ask_ai_question(user_query):
+    """
+    Sends a query to the Gemini AI API and returns the agricultural/weather-related response.
+    Constrains the AI to only answer questions related to agriculture or weather.
+    """
+    if not GEMINI_API_KEY:
+        return "AI service not available. API key missing."
+
+    # Define the system instruction for the AI
+    system_instruction = (
+        "You are an AI assistant specialized in agriculture and weather. "
+        "Your purpose is to provide helpful and accurate information on farming practices, "
+        "crop management, pest control, soil health, climate, and weather forecasts. "
+        "If a question is not related to agriculture or weather, "
+        "politely state that you can only answer questions within your domain."
+    )
+
+    chat_history = []
+    # Add the system instruction as a user message to guide the AI's persona
+    chat_history.append({"role": "user", "parts": [{"text": system_instruction}]})
+    # Add the actual user query
+    chat_history.append({"role": "user", "parts": [{"text": user_query}]})
+
+    payload = {"contents": chat_history}
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+    try:
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(api_url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        result = response.json()
+
+        if result.get('candidates') and len(result['candidates']) > 0 and \
+           result['candidates'][0].get('content') and \
+           result['candidates'][0]['content'].get('parts') and \
+           len(result['candidates'][0]['content']['parts']) > 0:
+            ai_text = result['candidates'][0]['content']['parts'][0]['text']
+            # USSD messages have character limits, so truncate if necessary
+            # Standard SMS is 160 characters for single part
+            return ai_text[:150] + "..." if len(ai_text) > 150 else ai_text
+        else:
+            print(f"Unexpected AI response structure: {result}")
+            return "Could not get a clear answer from AI. Please try again."
+
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred with AI API: {http_err} - Status Code: {response.status_code}")
+        return "Error connecting to AI. Please try again later."
+    except requests.exceptions.ConnectionError as conn_err:
+        print(f"Connection error occurred with AI API: {conn_err}")
+        return "Network error for AI. Please check your internet connection."
+    except requests.exceptions.Timeout as timeout_err:
+        print(f"Timeout error occurred with AI API: {timeout_err}")
+        return "AI request timed out. Please try again."
+    except requests.exceptions.RequestException as req_err:
+        print(f"An error occurred during AI API request: {req_err}")
+        return "An unexpected AI error occurred. Please try again."
+    except Exception as e:
+        print(f"An unexpected error occurred in ask_ai_question: {e}")
+        return "An unknown AI error occurred. Please try again."
 
 # --- USSD Callback Endpoint ---
 @app.route('/', methods=['POST', 'GET'])
 def ussd_callback():
     # Initialize response_text for each request
     response_text = ""
-
     # Read the variables sent by Africa's Talking
     session_id = request.values.get("sessionId", None)
     service_code = request.values.get("serviceCode", None)
@@ -109,7 +187,8 @@ def ussd_callback():
         response_text = "CON Welcome to MkulimaMkononi! \n"
         response_text += "1. Get Agri-Tips \n"
         response_text += "2. Weather Forecast \n"
-        response_text += "3. My Account"
+        response_text += "3. My Account \n"
+       
 
     elif text == '1':
         # User selected 'Get Agri-Tips'
@@ -162,11 +241,62 @@ def ussd_callback():
         response_text = "END Feature under development. Please contact support to change preferences."
 
     else:
-        # Handle invalid input or unexpected paths
         response_text = "END Invalid selection. Please try again."
 
-    # Return the response to Africa's Talking
     return response_text
+
+   
+
+# --- New Endpoint for Incoming SMS Messages ---
+@app.route('/incoming_sms', methods=['POST'])
+def incoming_sms():
+    # Africa's Talking sends incoming SMS as POST requests with form data
+    from_number = request.values.get("from", None)
+    to_number = request.values.get("to", None) # Your short code or sender ID
+    message = request.values.get("text", "").strip()
+    date = request.values.get("date", None)
+    id = request.values.get("id", None) # Message ID
+    link_id = request.values.get("linkId", None) # For concatenated messages
+
+    print(f"Received SMS from {from_number} to {to_number}: '{message}'")
+
+    response_message = ""
+    # Check if the message is an AI query (e.g., starts with "AI " or "ASK ")
+    if message.upper().startswith("AI "):
+        query = message[3:].strip() # Remove "AI " prefix
+        print(f"Processing AI query via SMS: '{query}'")
+        ai_response = ask_ai_question(query)
+        response_message = f"AI: {ai_response}"
+    elif message.upper().startswith("ASK "):
+        query = message[4:].strip() # Remove "ASK " prefix
+        print(f"Processing AI query via SMS: '{query}'")
+        ai_response = ask_ai_question(query)
+        response_message = f"AI: {ai_response}"
+    else:
+        # Handle other types of incoming SMS or provide general help
+        response_message = "Welcome to MkulimaMkononi SMS! To ask the Agri-AI, text 'AI Your question' or 'ASK Your question'."
+
+    # Send the response back via SMS
+    if sms and response_message:
+        try:
+            # Send the response back to the sender
+            # Use the 'to_number' from the incoming SMS as the sender_id if it's your short code
+            # Otherwise, use AFRICASTKNG or a registered alphanumeric sender ID
+            # For simplicity, we'll use AFRICASTKNG or the default.
+            # If you have a dedicated short code for replies, use that as sender_id.
+            # Example: sms.send(response_message, [from_number], sender_id="YOUR_SHORT_CODE")
+            at_response = sms.send(response_message, [from_number], sender_id="AFRICASTKNG")
+            print(f"SMS response sent to {from_number}: {at_response}")
+        except Exception as e:
+            print(f"Error sending SMS response: {e}")
+            # Log the error, but don't return an error to Africa's Talking
+            # as the incoming SMS webhook expects a 200 OK
+    else:
+        print("SMS service not initialized or no response message to send.")
+
+    # Africa's Talking expects a 200 OK response to acknowledge receipt of the SMS
+    return "OK", 200
+
 
 # --- Run the Flask Application ---
 if __name__ == '__main__':
