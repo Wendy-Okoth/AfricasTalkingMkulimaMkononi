@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MkulimaMkononi Agri-AI Chat</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+
+    <div class="bg-white shadow-lg rounded-lg p-6 max-w-md w-full h-[80vh] flex flex-col">
+        <h2 class="text-3xl font-extrabold text-green-700 mb-6 text-center">MkulimaMkononi Agri-AI</h2>
+
+        <div id="chat-messages" class="flex-1 overflow-y-auto p-4 border border-gray-200 rounded-lg mb-4 space-y-4">
+            </div>
+
+        <div class="flex space-x-2">
+            <input type="text" id="user-input" placeholder="Ask about agriculture or weather..."
+                   class="flex-1 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 text-gray-800">
+            <button id="send-button"
+                    class="px-6 py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 transition duration-200 ease-in-out">
+                Send
+            </button>
+        </div>
+    </div>
+
+    <template id="user-message-template">
+        <div class="flex justify-end">
+            <div class="bg-green-500 text-white p-3 rounded-lg max-w-[80%] break-words shadow-sm">
+                <p class="message-content"></p>
+            </div>
+        </div>
+    </template>
+
+    <template id="ai-message-template">
+        <div class="flex justify-start">
+            <div class="bg-gray-200 text-gray-800 p-3 rounded-lg max-w-[80%] break-words shadow-sm">
+                <p class="message-content"></p>
+            </div>
+        </div>
+    </template>
+
+    <script>
+        // Get references to DOM elements
+        const chatMessagesDiv = document.getElementById('chat-messages');
+        const userInput = document.getElementById('user-input');
+        const sendButton = document.getElementById('send-button');
+        const userMessageTemplate = document.getElementById('user-message-template');
+        const aiMessageTemplate = document.getElementById('ai-message-template');
+
+        // IMPORTANT: GEMINI_API_KEY
+        // For local testing on your machine:
+        // Replace "YOUR_GEMINI_API_KEY_HERE" with the actual API key you got from Google AI Studio.
+        // const GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE";
+
+        // For running in the Canvas environment (e.g., if you copy this to a Replit/similar setup provided by a platform):
+        // Leave it as an empty string. The key is often injected automatically at runtime.
+        const GEMINI_API_KEY = "AIzaSyD3kgalsooT81mNrARknLFJjsjH7BJzbRE"; // Use this for Canvas/platform environments
+
+        // Function to append messages to the chat display
+        function appendMessage(sender, text) {
+            let messageElement;
+            if (sender === 'user') {
+                messageElement = userMessageTemplate.content.cloneNode(true);
+            } else {
+                messageElement = aiMessageTemplate.content.cloneNode(true);
+            }
+            messageElement.querySelector('.message-content').textContent = text;
+            chatMessagesDiv.appendChild(messageElement);
+            // Scroll to the bottom of the chat
+            chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight;
+        }
+
+        // Function to send user query to AI and display response
+        async function askAI(query) {
+            if (!GEMINI_API_KEY) {
+                appendMessage('ai', 'Error: AI service not available. API key is missing.');
+                console.error("GEMINI_API_KEY is not set.");
+                return;
+            }
+
+            // Show a loading indicator
+            const loadingMessage = "AI is typing...";
+            const loadingElement = document.createElement('div');
+            loadingElement.className = 'flex justify-start';
+            loadingElement.innerHTML = `
+                <div class="bg-gray-200 text-gray-600 p-3 rounded-lg max-w-[80%] break-words shadow-sm italic">
+                    ${loadingMessage}
+                </div>`;
+            chatMessagesDiv.appendChild(loadingElement);
+            chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight; // Scroll to loading
+
+            // Define the system instruction for the AI
+           const systemInstruction = `
+You are an AI assistant specialized in agriculture and weather.
+Your purpose is to provide helpful and accurate information on farming practices,
+crop management, pest control, soil health, climate, and weather forecasts.
+If a question is not related to agriculture or weather,
+politely state that you can only answer questions within your domain.
+            `.trim();
+
+            // Prepare the payload for the Gemini API
+            const chatHistory = [];
+            chatHistory.push({ "role": "user", "parts": [{ "text": systemInstruction }] });
+            chatHistory.push({ "role": "user", "parts": [{ "text": query }] });
+
+            const payload = { "contents": chatHistory };
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error("AI API Error:", response.status, response.statusText, errorData);
+                    appendMessage('ai', 'Oops! There was an issue getting a response from the AI. Please try again.');
+                    return;
+                }
+
+                const result = await response.json();
+
+                let aiText = "Could not get a clear answer from AI. Please try again.";
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content &&
+                    result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    aiText = result.candidates[0].content.parts[0].text;
+                } else {
+                    console.warn("Unexpected AI response structure:", result);
+                }
+                appendMessage('ai', aiText);
+
+            } catch (error) {
+                console.error("Network or parsing error:", error);
+                appendMessage('ai', 'A network error occurred. Please check your internet connection and try again.');
+            } finally {
+                // Remove loading indicator
+                if (loadingElement && loadingElement.parentNode) {
+                    loadingElement.parentNode.removeChild(loadingElement);
+                }
+                chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight; // Scroll again after removing loading
+            }
+        }
+
+        // Handle user input and send message
+        function sendMessage() {
+            const userQuery = userInput.value.trim();
+            if (userQuery === '') {
+                return; // Don't send empty messages
+            }
+
+            appendMessage('user', userQuery);
+            userInput.value = ''; // Clear input field
+
+            askAI(userQuery);
+        }
+
+        // Event listeners
+        sendButton.addEventListener('click', sendMessage);
+        userInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Initial welcome message
+        document.addEventListener('DOMContentLoaded', () => {
+            appendMessage('ai', "Hello! I'm MkulimaMkononi Agri-AI. Ask me anything about agriculture or weather!");
+        });
+
+    </script>
+</body>
+</html>
