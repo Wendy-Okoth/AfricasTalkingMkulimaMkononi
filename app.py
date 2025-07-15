@@ -4,30 +4,17 @@ from dotenv import load_dotenv
 import requests # Import the requests library for making HTTP calls
 import json
 import africastalking
+import urllib.parse
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
 
-# --- Africa's Talking Credentials (for later SMS/Voice integration) ---
-# These are loaded from your .env file.
-# Ensure your .env file has:
-# AT_USERNAME="your_africas_talking_username"
-# AT_API_KEY="your_africas_talking_api_key"
+
 AT_USERNAME = os.getenv("AT_USERNAME")
 AT_API_KEY = os.getenv("AT_API_KEY")
-
-# --- OpenWeatherMap API Key ---
-# This is loaded from your .env file.
-# Ensure your .env file has:
-# OPENWEATHER_API_KEY="YOUR_OPENWEATHERMAP_API_KEY"
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-
-
-# --- Gemini API Key (for the AI chatbox) ---
-# IMPORTANT: As per instructions, leave this as an empty string.
-# The Canvas environment will automatically provide the API key at runtime.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Basic checks to ensure credentials are loaded
@@ -56,7 +43,6 @@ except Exception as e:
 # In a production environment, you would use a persistent database (like Firestore)
 # for session management. For a hackathon, in-memory is acceptable.
 session_states = {}
-
 
 # --- Helper Function to Get Weather Forecast ---
 def get_weather_forecast(city_name):
@@ -166,6 +152,128 @@ def ask_ai_question(user_query):
         print(f"An unexpected error occurred in ask_ai_question: {e}")
         return "An unknown AI error occurred. Please try again."
 
+def get_nominatim_geocode(location_name):
+    """
+    Converts a location name into latitude and longitude coordinates using Nominatim (OpenStreetMap).
+    """
+    # Nominatim requires a User-Agent header
+    headers = {'User-Agent': 'MkulimaMkononiApp/1.0 (contact@example.com)'} # Replace with your actual contact
+
+    # 'format=json' for JSON output, 'limit=1' for the top result, 'countrycodes=ke' for Kenya
+    nominatim_url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(location_name)}&format=json&limit=1&countrycodes=ke"
+
+    try:
+        response = requests.get(nominatim_url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+        if data and len(data) > 0:
+            lat = data[0]['lat']
+            lon = data[0]['lon']
+            return lat, lon
+        else:
+            return None, "Location not found by Nominatim."
+    except requests.exceptions.RequestException as e:
+        print(f"Network error during Nominatim geocoding: {e}")
+        return None, "Network error getting location."
+    except Exception as e:
+        print(f"An unexpected error occurred in get_nominatim_geocode: {e}")
+        return None, "An unknown error occurred."
+
+def find_nearest_stores_osm(location_name):
+    """
+    Finds nearest agricultural supply stores using Nominatim for geocoding and
+    Overpass API for place search based on OpenStreetMap data.
+    """
+    # First, get the coordinates of the user's input location
+    lat, lon_error = get_nominatim_geocode(location_name)
+    if lat is None:
+        return f"Could not find coordinates for '{location_name}'. {lon_error}"
+
+    # Overpass API query to find shops related to agriculture/farm supplies/agrovet
+    # We use a bounding box around the location for a broader search, e.g., 0.5 degrees lat/lon (approx 55km)
+    # This query searches for nodes, ways, and relations with relevant tags
+    # The 'around' filter finds objects within a radius (e.g., 50000 meters = 50 km)
+    overpass_query = f"""
+    [out:json];
+    (
+      node["shop"~"agrarian|farm|garden_centre|agrovet"](around:50000,{lat},{lon_error});
+      way["shop"~"agrarian|farm|garden_centre|agrovet"](around:50000,{lat},{lon_error});
+      relation["shop"~"agrarian|farm|garden_centre|agrovet"](around:50000,{lat},{lon_error});
+      node["amenity"="veterinary"](around:50000,{lat},{lon_error});
+      way["amenity"="veterinary"](around:50000,{lat},{lon_error});
+      relation["amenity"="veterinary"](around:50000,{lat},{lon_error});
+    );
+    out center;
+    """
+    # Public Overpass API endpoint
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    headers = {'User-Agent': 'MkulimaMkononiApp/1.0 (contact@example.com)'} # Required for Overpass
+
+    try:
+        response = requests.post(overpass_url, data={"data": overpass_query}, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+        stores = []
+        if data['elements']:
+            # Prioritize nodes, then ways, then relations
+            sorted_elements = sorted(data['elements'], key=lambda x: (x['type'] == 'node', x['type'] == 'way'), reverse=True)
+
+            # Keep track of unique names to avoid duplicates if multiple elements represent same store
+            unique_names = set()
+
+            for i, element in enumerate(sorted_elements):
+                if i >= 3: # Limit to top 3 results for USSD
+                    break
+
+                name = element.get('tags', {}).get('name', 'Unnamed Store')
+                # Try to get a more specific address
+                address_parts = []
+                if element.get('tags', {}).get('addr:street'):
+                    address_parts.append(element['tags']['addr:street'])
+                if element.get('tags', {}).get('addr:housenumber'):
+                    address_parts.append(element['tags']['addr:housenumber'])
+                if element.get('tags', {}).get('addr:city'):
+                    address_parts.append(element['tags']['addr:city'])
+                elif element.get('tags', {}).get('addr:place'):
+                    address_parts.append(element['tags']['addr:place'])
+                else: # Fallback to display name from Nominatim if available or just location name
+                    address_parts.append(location_name)
+
+                address = ", ".join(address_parts) if address_parts else "Address N/A"
+
+                # Simple deduplication by name
+                if name in unique_names:
+                    continue
+                unique_names.add(name)
+
+                # Generate Google Maps directions link for the first store
+                directions_link = ""
+                if i == 0 and element.get('lat') and element.get('lon'):
+                    # Use store's actual lat/lon for destination
+                    destination_coords = f"{element['lat']},{element['lon']}"
+                    # You can optionally add a starting point here if you had user's current GPS
+                    # For USSD, we typically assume user is near the location they typed
+                    directions_link = f"\nMap: https://www.google.com/maps/dir/?api=1&destination={destination_coords}&travelmode=driving"
+
+                stores.append(f"{i+1}. {name}, {address}{directions_link}")
+
+            if stores:
+                return "\n".join(stores)
+            else:
+                return f"No agricultural supply stores found near '{location_name}'. Try a different location or broader area."
+        else:
+            return f"No agricultural supply stores found near '{location_name}'. Try a different location or broader area."
+
+    except requests.exceptions.RequestException as e:
+        print(f"Network error during Overpass search: {e}")
+        return "Network error finding stores."
+    except Exception as e:
+        print(f"An unexpected error occurred in find_nearest_stores_osm: {e}")
+        return "An unknown error occurred."
+
+
 # --- USSD Callback Endpoint ---
 @app.route('/', methods=['POST', 'GET'])
 def ussd_callback():
@@ -188,6 +296,7 @@ def ussd_callback():
         response_text += "1. Get Agri-Tips \n"
         response_text += "2. Weather Forecast \n"
         response_text += "3. My Account \n"
+        response_text += "4. Find Supply Store \n"
        
 
     elif text == '1':
@@ -239,13 +348,23 @@ def ussd_callback():
         # This would lead to another menu to select new crop.
         # For now, we'll just end the session.
         response_text = "END Feature under development. Please contact support to change preferences."
+    
+    elif text == '4': # Store Locator option selected
+        response_text = "CON Please enter your current town or area in Kenya (e.g., Eldoret, Kitale):"
+        session_states[session_id] = 'awaiting_store_location'
+
+    elif current_state == 'awaiting_store_location':
+        location_input = text.split('*')[-1].strip()
+        print(f"DEBUG: Searching for stores near: '{location_input}' using OSM APIs")
+        store_results = find_nearest_stores_osm(location_input) # Use the new OSM function
+        response_text = "END Nearest Stores:\n" + store_results
+        if session_id in session_states:
+            del session_states[session_id]
 
     else:
         response_text = "END Invalid selection. Please try again."
 
     return response_text
-
-   
 
 # --- New Endpoint for Incoming SMS Messages ---
 @app.route('/incoming_sms', methods=['POST'])
